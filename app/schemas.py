@@ -88,6 +88,18 @@ VIOLATION_RETEST_GROUP_UNKNOWN = "RETEST_GROUP_UNKNOWN"
 VIOLATION_RETEST_INSUFFICIENT_SAMPLES = "RETEST_INSUFFICIENT_SAMPLES"
 VIOLATION_RETEST_NO_SOLUTION = "RETEST_NO_SOLUTION"
 
+# Categories reported in 422 responses of the cross-batch comparison plan
+# endpoint. Every plan member must be a sample that is still on its planned
+# well with a valid reading in the ACTIVE batch's current revision snapshot;
+# any structural problem fails the whole request and nothing is saved.
+VIOLATION_XCOMP_BATCH_DUPLICATED = "XCOMP_BATCH_DUPLICATED"
+VIOLATION_XCOMP_COMPARISON_DUPLICATED = "XCOMP_COMPARISON_DUPLICATED"
+VIOLATION_XCOMP_SAMPLE_UNKNOWN_BATCH = "XCOMP_SAMPLE_UNKNOWN_BATCH"
+VIOLATION_XCOMP_COMPARISON_INCOMPLETE = "XCOMP_COMPARISON_INCOMPLETE"
+VIOLATION_XCOMP_SAMPLE_NOT_ELIGIBLE = "XCOMP_SAMPLE_NOT_ELIGIBLE"
+VIOLATION_XCOMP_SAMPLE_DUPLICATED = "XCOMP_SAMPLE_DUPLICATED"
+VIOLATION_XCOMP_NO_SOLUTION = "XCOMP_NO_SOLUTION"
+
 
 class PlateSpec(BaseModel):
     """Plate geometry.
@@ -589,3 +601,72 @@ class RetestPlanRequest(BaseModel):
         if any(n < 0 for n in v.values()):
             raise ValueError("every group count must be >= 0")
         return v
+
+
+class CrossBatchRef(BaseModel):
+    """One ACTIVE batch certificate participating in a comparison plate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(min_length=1, description="ACTIVE 批次证书的批次标识")
+    expected_revision: int = Field(
+        ge=1, description="该批次证书的期望当前 revision;与当前值不符整次失败(409)"
+    )
+
+
+class CrossBatchMember(BaseModel):
+    """The one sample a named batch contributes to a comparison."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(min_length=1, description="批次标识,必须出现在 batches 中")
+    sample_id: str = Field(min_length=1, description="该批次冻结快照中的样本 id")
+
+
+class CrossBatchComparison(BaseModel):
+    """One cross-batch comparison: exactly one sample per participating batch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    comparison_id: str = Field(min_length=1, description="对照标识,整个请求内唯一")
+    members: list[CrossBatchMember] = Field(
+        min_length=1, description="每个参与批次一个样本 {batch_id, sample_id}"
+    )
+
+
+class CrossBatchPlanRequest(BaseModel):
+    """Cross-batch comparison plate laid out over several ACTIVE batches.
+
+    The caller submits 2-4 ACTIVE batch certificates (each pinned to its
+    expected current revision), one comparison set per ``comparison_id`` with
+    exactly one sample per batch, the target plate geometry, blocked wells and
+    a seed. For every named batch the service checks, inside one SQLite
+    transaction, that the certificate is still ACTIVE at the expected
+    revision and confirms from that revision's immutable snapshot that each
+    requested sample is on its planned well, matches the frozen scan and has
+    a valid (finite) reading. Any stale revision, duplicated/missing sample
+    or infeasibility fails the whole request and nothing is saved.
+
+    The samples of every comparison are then placed on the target plate so
+    that the number of orthogonal (up/down/left/right) adjacency edges inside
+    the same comparison is maximised first; the number of rows + columns
+    covered by every batch and every experiment group is maximised second;
+    ``seed`` resolves every remaining tie deterministically.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_key: str = Field(
+        min_length=1, description="幂等键:同键同内容重放已记录响应,同键不同内容返回 409"
+    )
+    batches: list[CrossBatchRef] = Field(
+        min_length=2, max_length=4, description="参与对照的 ACTIVE 批次(2–4 个)"
+    )
+    comparisons: list[CrossBatchComparison] = Field(
+        min_length=1, description="对照清单;每个 comparison_id 为每个批次指定一个样本"
+    )
+    plate: PlateSpec = Field(default_factory=PlateSpec)
+    blocked_wells: list[str] = Field(
+        default_factory=list, description="目标板禁用孔位,不可放置任何样本"
+    )
+    seed: int = Field(default=0, ge=0, description="随机种子(≥0),控制确定性决胜")

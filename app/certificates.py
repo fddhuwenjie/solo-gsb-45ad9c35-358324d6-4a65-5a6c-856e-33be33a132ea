@@ -127,6 +127,18 @@ CREATE TABLE IF NOT EXISTS retest_plans (
     plan_body       TEXT NOT NULL,
     created_at      TEXT NOT NULL
 );
+-- Cross-batch comparison plans. Each row pins every source certificate's
+-- revision (and that revision's content digest) the member samples were
+-- confirmed against; advancing any source certificate never mutates stored
+-- plans.
+CREATE TABLE IF NOT EXISTS cross_batch_plans (
+    plan_id         TEXT PRIMARY KEY,
+    batch_ids       TEXT NOT NULL,
+    revisions       TEXT NOT NULL,
+    seed            INTEGER NOT NULL,
+    plan_body       TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
 """
 
 

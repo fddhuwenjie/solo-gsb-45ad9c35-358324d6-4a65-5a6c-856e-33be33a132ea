@@ -13,10 +13,11 @@ from .plates import parse_well
 from .blinding import BlindInvalid, blind, unblind
 from .certificates import create_certificate, reverify_certificate
 from .retest import create_retest_plan
+from .cross_batch import create_cross_batch_plan
 from .dilution import DilutionPlanInvalid, dilution_plan
 from .reconciler import ReconcileInvalid, StagingConflict, reconcile
 from .release import ReleaseInvalid, batch_release, release_invalid_body
-from .schemas import ArrangeRequest, BatchReleaseRequest, BlindRequest, CertificateCreateRequest, CertificateReverifyRequest, DilutionPlanRequest, ReconcileRequest, RetestPlanRequest, SpatialQCRequest, UnblindRequest
+from .schemas import ArrangeRequest, BatchReleaseRequest, BlindRequest, CertificateCreateRequest, CertificateReverifyRequest, CrossBatchPlanRequest, DilutionPlanRequest, ReconcileRequest, RetestPlanRequest, SpatialQCRequest, UnblindRequest
 from .spatial_qc import SpatialQCInvalid, spatial_qc
 
 app = FastAPI(
@@ -382,4 +383,20 @@ async def reverify_batch_certificate(req: CertificateReverifyRequest) -> JSONRes
 )
 async def create_batch_retest_plan(req: RetestPlanRequest) -> JSONResponse:
     status, body = create_retest_plan(req)
+    return JSONResponse(status_code=status, content=body)
+
+
+@app.post(
+    "/api/v1/certificates/cross-batch-plans",
+    summary="为多个 ACTIVE 批次生成跨批次对照排板计划(同事务核对 revision/快照,字典序 CP-SAT)",
+    responses={
+        201: {"description": "各证书仍为期望当前 revision 且样本在快照中可选;计划与幂等记录在同一 SQLite 事务保存,返回 sample→well 布局及来源 revision/digest"},
+        404: {"description": "某个批次无证书"},
+        409: {"description": "某批次证书已吊销或 expected_revision 与当前 revision 不符,或 request_key 曾被不同内容使用;不保存计划"},
+        422: {"description": "批次/对照重复、成员缺失、样本在冻结快照中不可选(错位/缺读数)、目标板容量不足/孔位非法或约束无解;整次失败且不保存"},
+        503: {"description": "求解超时,不保存计划"},
+    },
+)
+async def create_cross_batch_plan_endpoint(req: CrossBatchPlanRequest) -> JSONResponse:
+    status, body = create_cross_batch_plan(req)
     return JSONResponse(status_code=status, content=body)

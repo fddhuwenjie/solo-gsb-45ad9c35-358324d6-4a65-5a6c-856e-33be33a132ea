@@ -127,6 +127,20 @@ CREATE TABLE IF NOT EXISTS retest_plans (
     plan_body       TEXT NOT NULL,
     created_at      TEXT NOT NULL
 );
+-- Cross-batch comparison layout plans. One row spans 2-4 ACTIVE certificates:
+-- it pins, per participating batch, the certificate revision (and that
+-- revision's content digest) whose frozen layout/scan/readings the samples
+-- were confirmed against; advancing any certificate later never mutates
+-- stored plans.
+CREATE TABLE IF NOT EXISTS cross_batch_plans (
+    plan_id         TEXT PRIMARY KEY,
+    request_key     TEXT NOT NULL,
+    batch_count     INTEGER NOT NULL,
+    sources         TEXT NOT NULL,
+    seed            INTEGER NOT NULL,
+    plan_body       TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
 """
 
 

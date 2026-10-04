@@ -13,10 +13,11 @@ from .plates import parse_well
 from .blinding import BlindInvalid, blind, unblind
 from .certificates import create_certificate, reverify_certificate
 from .retest import create_retest_plan
+from .cross_batch import CrossBatchPlanInvalid, create_comparison_plan, cross_batch_invalid_body
 from .dilution import DilutionPlanInvalid, dilution_plan
 from .reconciler import ReconcileInvalid, StagingConflict, reconcile
 from .release import ReleaseInvalid, batch_release, release_invalid_body
-from .schemas import ArrangeRequest, BatchReleaseRequest, BlindRequest, CertificateCreateRequest, CertificateReverifyRequest, DilutionPlanRequest, ReconcileRequest, RetestPlanRequest, SpatialQCRequest, UnblindRequest
+from .schemas import ArrangeRequest, BatchReleaseRequest, BlindRequest, CertificateCreateRequest, CertificateReverifyRequest, CrossBatchPlanRequest, DilutionPlanRequest, ReconcileRequest, RetestPlanRequest, SpatialQCRequest, UnblindRequest
 from .spatial_qc import SpatialQCInvalid, spatial_qc
 
 app = FastAPI(
@@ -158,6 +159,14 @@ async def dilution_invalid_handler(request: Request, exc: DilutionPlanInvalid) -
             "messages": exc.messages,
         },
     )
+
+
+@app.exception_handler(CrossBatchPlanInvalid)
+async def cross_batch_invalid_handler(request: Request, exc: CrossBatchPlanInvalid) -> JSONResponse:
+    # 422 whenever a comparison plan is structurally impossible or proven
+    # infeasible outside a recorded plan-building transaction; no plan is
+    # produced.
+    return JSONResponse(status_code=422, content=cross_batch_invalid_body(exc))
 
 
 @app.get("/", include_in_schema=False)
@@ -382,4 +391,20 @@ async def reverify_batch_certificate(req: CertificateReverifyRequest) -> JSONRes
 )
 async def create_batch_retest_plan(req: RetestPlanRequest) -> JSONResponse:
     status, body = create_retest_plan(req)
+    return JSONResponse(status_code=status, content=body)
+
+
+@app.post(
+    "/api/v1/certificates/comparison-plans",
+    summary="跨批次对照排板:在多个 ACTIVE 批次当前 revision 上生成对照板布局",
+    responses={
+        201: {"description": "每个证书均为当前 revision、样本在孔/扫描吻合/读数有效;同一 SQLite 事务中保存对照计划与幂等记录,返回 sample→well 布局与来源 revision/digest"},
+        404: {"description": "任一参与批次无证书"},
+        409: {"description": "任一证书已吊销或 expected_revision 与当前 revision 不符,或 request_key 曾被不同内容使用;不保存计划"},
+        422: {"description": "批次/对照重复、每个批次未恰好一个样本、样本未知/重复/无效(错位/缺失/读数无效)、容量不足或约束无解;整次失败,不保存计划"},
+        503: {"description": "求解超时,不保存计划"},
+    },
+)
+async def create_cross_batch_comparison_plan(req: CrossBatchPlanRequest) -> JSONResponse:
+    status, body = create_comparison_plan(req)
     return JSONResponse(status_code=status, content=body)

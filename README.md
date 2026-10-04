@@ -32,6 +32,7 @@ docker compose up --build
 - 双人协作解盲： `POST http://localhost:8000/api/v1/blinding/unblind`
 - 批次证书建立： `POST http://localhost:8000/api/v1/certificates`
 - 证书重核验： `POST http://localhost:8000/api/v1/certificates/reverify`
+- 跨批次对照排板： `POST http://localhost:8000/api/v1/certificates/comparison-plans`
 
 不使用 Docker 时（Python 3.11+):
 
@@ -856,6 +857,157 @@ curl -X POST http://localhost:8000/api/v1/certificates/retest-plans \
 相关的 422（组未知、样本不足、孔位非法）会像普通响应一样记录在键上，重放返回
 同一 422。
 
+## 跨批次对照排板 `POST /api/v1/certificates/comparison-plans`
+
+为 **2～4 个 ACTIVE 批次证书**的当前 revision 联合生成一张跨批次对照板。调用方
+提交 `request_key`、2～4 个批次引用（`batch_id` + `expected_revision`)、一个或
+多个对照（`comparison_id` → **每个批次恰好一个** `sample_id`)、目标板型 `plate`、
+目标板禁用孔位 `blocked_wells` 与 `seed`。同一批次样本在一次请求中至多服务于一
+个对照（样本重复即整次失败）。
+
+服务在**同一 SQLite 事务**中:
+
+1. 核对每个证书仍为 **ACTIVE** 且当前 revision 等于 `expected_revision`（任一不
+   符即整次失败，见状态码表）；
+2. 从各批次**不可变 revision 快照**逐一确认被指定样本：存在于冻结计划、其计划孔
+   在冻结 scan 中**恰好仍由该样本占据**（错位/缺失/多占不合格）、计划孔未被快照
+   禁用、且该孔具有**有效读数**（存在、非 `null`、有限数值）；
+3. 任何版本过期、批次/对照重复、对照缺批次、样本重复/未知/不合格、容量不足或约束
+   无解，**整次失败且不保存**（内容类 422 记录在 `request_key` 上）。
+
+确认通过后，按字典序三阶段 CP-SAT 排板：
+
+1. **最大化同一 comparison 两个（或多个）成员的正交相邻边数**（上下左右，不含对
+   角）；
+2. **最大化各批次、各（批次 × 实验组）覆盖的行数 + 列数之和**；
+3. 以 `seed` 做确定性决胜——相同（各 revision 快照、对照、目标板、禁用孔、seed)
+   必然得到逐孔一致的布局。
+
+响应返回 `batch:sample` → 目标 `well` 的 `layout`、逐对照成员/孔位/相邻边数、
+逐批次（含逐实验组）覆盖明细，以及每个来源批次的 `revision`/`digest`；计划行钉住
+这些来源 revision/digest，任一证书后续推进 revision 不会改动已存计划。读取证书
+状态、冻结快照、写入计划与幂等记录在**同一事务**中完成。
+
+端口 `8000` 调用示例：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/certificates/comparison-plans \
+  -H "Content-Type: application/json" \
+  -d '{
+    "request_key": "cmp-2026-10-04-01",
+    "batches": [
+      {"batch_id": "B2026-0042", "expected_revision": 2},
+      {"batch_id": "B2026-0051", "expected_revision": 1},
+      {"batch_id": "B2026-0058", "expected_revision": 3}
+    ],
+    "comparisons": [
+      {"comparison_id": "CMP-A",
+       "samples": {"B2026-0042": "S4201", "B2026-0051": "S5107", "B2026-0058": "S5803"}},
+      {"comparison_id": "CMP-B",
+       "samples": {"B2026-0042": "S4208", "B2026-0051": "S5112", "B2026-0058": "S5810"}}
+    ],
+    "plate": {"type": "96"},
+    "blocked_wells": ["A1", "H12"],
+    "seed": 2026
+  }'
+```
+
+### 跨批次对照请求字段
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `request_key` | string | **幂等键**：同键同内容重放已记录响应，同键不同内容返回 409 |
+| `batches` | array | 2～4 项 `{batch_id, expected_revision}`；`batch_id` 不得重复 |
+| `comparisons` | array | 至少一项 `{comparison_id, samples}`;`comparison_id` 不得重复；`samples` 为 batch_id → sample_id，**必须为每个参与批次恰好给一个**，且不得引用 `batches` 之外的批次 |
+| `plate` | object | 目标板型（同编排接口：`"24"`/`"48"`/`"96"`/`"384"`/`"custom"`) |
+| `blocked_wells` | string[] | 目标板禁用孔位（默认空）；非法孔名返回 422 |
+| `seed` | int | 随机种子（≥0，默认 0)，用于最后的确定性决胜 |
+
+### 排板成功（201)
+
+```json
+{
+  "plan_id": "cmp-7d2a1f0c9b4e5a682130cdef",
+  "request_key": "cmp-2026-10-04-01",
+  "status": "ACTIVE",
+  "plate": {"type": "96", "rows": 8, "columns": 12,
+            "blocked_wells": ["A1", "H12"], "available_wells": ["A2", "..."]},
+  "sources": [
+    {"batch_id": "B2026-0042", "certificate_id": "cert-...", "status": "ACTIVE",
+     "revision": 2, "digest": "9d1c0e4b..."},
+    {"batch_id": "B2026-0051", "certificate_id": "cert-...", "status": "ACTIVE",
+     "revision": 1, "digest": "a12fe091..."},
+    {"batch_id": "B2026-0058", "certificate_id": "cert-...", "status": "ACTIVE",
+     "revision": 3, "digest": "33bc7d40..."}
+  ],
+  "comparisons": [
+    {"comparison_id": "CMP-A",
+     "members": [
+       {"batch_id": "B2026-0042", "sample_id": "S4201",
+        "qualified_sample_id": "B2026-0042:S4201", "group": "treated", "well": "A2"},
+       {"batch_id": "B2026-0051", "sample_id": "S5107",
+        "qualified_sample_id": "B2026-0051:S5107", "group": "treated", "well": "A3"},
+       {"batch_id": "B2026-0058", "sample_id": "S5803",
+        "qualified_sample_id": "B2026-0058:S5803", "group": "control", "well": "B2"}
+     ],
+     "wells": ["A2", "A3", "B2"],
+     "same_comparison_adjacent_edges_count": 2}
+  ],
+  "layout": {"B2026-0042:S4201": "A2", "B2026-0051:S5107": "A3", "...": "..."},
+  "samples": [
+    {"sample_id": "S4201", "well": "A2", "batch_id": "B2026-0042",
+     "comparison_id": "CMP-A", "group": "treated"}
+  ],
+  "wells": ["A2", "A3", "..."],
+  "metrics": {
+    "same_comparison_adjacent_edges_count": 3,
+    "same_comparison_adjacent_edges": [
+      {"comparison_id": "CMP-A", "wells": ["A2", "A3"]}
+    ],
+    "total_orthogonal_edges": 172,
+    "coverage": {
+      "rows_plus_columns_sum": 41,
+      "by_batch": [
+        {"batch_id": "B2026-0042",
+         "covered_rows": ["A", "B"], "covered_columns": [2, 9],
+         "rows_covered": 2, "columns_covered": 2,
+         "groups": [{"group": "treated", "covered_rows": ["A", "B"],
+                     "covered_columns": [2, 9], "rows_covered": 2,
+                     "columns_covered": 2}]}
+      ]
+    }
+  },
+  "seed": 2026,
+  "solver": {
+    "stages": [
+      {"stage": "1_comparison_adjacency", "objective_value": 3, "status": "OPTIMAL", "proven_optimal": true, "wall_time_seconds": 0.011},
+      {"stage": "2_batch_coverage", "objective_value": 41, "status": "OPTIMAL", "proven_optimal": true, "wall_time_seconds": 0.006},
+      {"stage": "3_tiebreak", "objective_value": -1, "status": "OPTIMAL", "proven_optimal": true, "wall_time_seconds": 0.001}
+    ]
+  }
+}
+```
+
+- `layout` 的键为限定样本 id `batch_id:sample_id`（不同批次的样本 id 即使相同也不
+  冲突）;`samples`/`wells` 按目标孔行主序给出；
+- `sources` 逐批次给出本计划所依据 revision 的版本号与该不可变快照的 SHA-256;
+- `metrics.same_comparison_adjacent_edges` 列出被排为正交相邻的同对照孔对；
+  `metrics.coverage.by_batch` 给出每批次及批次内每实验组覆盖的行/列。
+
+### 不生成计划的情形
+
+| 状态码 | 情形 |
+| --- | --- |
+| 404 | 任一参与批次无证书（`error = "CERTIFICATE_NOT_FOUND"`) |
+| 409 | 任一证书已吊销（`CERTIFICATE_REVOKED`，**吊销不可逆**）、`expected_revision` 与该证书当前 revision 不符（`CERTIFICATE_REVISION_MISMATCH`，附 `current_revision`)——**重核验推进 revision 后，使用旧 revision 的请求（包括旧键重放）一律 409**；或 `request_key` 曾被不同内容（含其他证书接口）使用（`REQUEST_KEY_CONFLICT`) |
+| 422 | 批次重复（`CROSS_BATCH_BATCH_DUPLICATED`)、`comparison_id` 重复（`CROSS_BATCH_COMPARISON_DUPLICATED`)、对照未给齐每个批次一个样本或引用了未参与批次（`CROSS_BATCH_COMPARISON_INCOMPLETE`)、同批次样本被多个对照使用（`CROSS_BATCH_SAMPLE_DUPLICATED`)、样本在快照中未知（`CROSS_BATCH_SAMPLE_UNKNOWN`)、样本错位/缺失/读数无效/计划孔被快照禁用（`CROSS_BATCH_SAMPLE_NOT_ELIGIBLE`)、目标板容量不足（`CROSS_BATCH_CAPACITY_EXCEEDED`)、目标板禁用孔非法（`WELL_REFERENCE_INVALID`) 或约束被证明无解（`CROSS_BATCH_NO_SOLUTION`);**整次失败，不保存计划** |
+| 503 | 求解器在时间预算内未完成，**不保存计划** |
+
+幂等语义与复测计划一致：**同键同内容重放原响应**（不重复生成计划行）；**同键不
+同内容 409**。与批次状态相关的拒绝（404/409 无证书、已吊销、revision 不符）**不
+占用** `request_key`——状态修正后可用同键重试；内容相关的 422 会记录在键上，重
+放返回同一 422。
+
 ## 稀释梯度配制计划 `POST /api/v1/arrangements/dilution-plan`
 
 为**既有编排结果**（编排接口响应中的 `layout`，即 sample_id → well 映射）
@@ -1201,6 +1353,11 @@ curl -X POST http://localhost:8000/api/v1/blinding/unblind \
   快照,组配额,避开孔位,seed)必然得到逐孔一致的样本/孔位计划、组计数与覆盖
   指标;计划只允许从有有效读数且未被禁用/避开/错位的样本中抽取,每组数量恰好
   满足。读取证书状态、冻结快照、写入计划与幂等记录在同一 SQLite 事务内完成。
+- 跨批次对照排板按三阶段字典序求解(同对照正交相邻边数 → 各批次/各实验组覆盖
+  行列数 → seed 决胜):第三阶段同样回注最优解 hint 并取首个解,因此相同(各
+  revision 快照,对照集,目标板,禁用孔位,seed)必然得到逐孔一致的布局;每个
+  被选样本必须同时满足计划孔在孔、冻结 scan 吻合且读数有效。读取全部证书状态、
+  冻结快照、写入计划与幂等记录在同一 SQLite 事务内完成。
 
 ## 配置（环境变量）
 
@@ -1235,11 +1392,12 @@ app/
   release.py   批次放行两级门控:扫描吻合核验（复用纠位规则）→ 空间质控放行门
   certificates.py 批次证书:放行结果冻结快照（SQLite 单事务）、按 revision 追加不可变证据快照的重核验（通过则重算 digest,失败则吊销）、request_key 幂等
   retest.py    复测抽样计划:仅从有效读数且未排除样本中抽取,三阶段字典序 CP-SAT(覆盖行列 → 同批次相邻对 → seed 决胜),计划与幂等记录在证书同一 SQLite 事务内持久化
+  cross_batch.py 跨批次对照排板:核对 2~4 个 ACTIVE 证书当前 revision,从不可变快照确认样本在孔/扫描吻合/读数有效,三阶段字典序 CP-SAT(同对照相邻边 → 批次/实验组覆盖行列 → seed 决胜),计划与幂等记录在同一 SQLite 事务内持久化
   dilution.py  稀释梯度配制:共享库存核算 + 分辨率取整 + 容差校验,确定性逐步移液指令
   blinding.py  双人协作盲化/解盲:AES-256-GCM 认证加密映射包 + XOR 双份额
   metrics.py   指标独立重算与布局约束校验
   plates.py    板型预设与孔位命名解析
-tests/         pytest 测试（解析、求解、API、纠位、空间质控、批次放行、批次证书、复测抽样、稀释计划、盲化解盲）
+tests/         pytest 测试（解析、求解、API、纠位、空间质控、批次放行、批次证书、复测抽样、跨批次对照排板、稀释计划、盲化解盲）
 Dockerfile     单容器构建
 docker-compose.yml  单命令启动（含证书数据库命名卷）
 ```

@@ -88,6 +88,20 @@ VIOLATION_RETEST_GROUP_UNKNOWN = "RETEST_GROUP_UNKNOWN"
 VIOLATION_RETEST_INSUFFICIENT_SAMPLES = "RETEST_INSUFFICIENT_SAMPLES"
 VIOLATION_RETEST_NO_SOLUTION = "RETEST_NO_SOLUTION"
 
+# Categories reported in 422 responses of the cross-batch comparison plan
+# endpoint. A plan is produced only when every named batch certificate is
+# ACTIVE at its expected revision and every named sample is still on its
+# planned well in the frozen scan with a valid reading; any structural or
+# content problem fails the whole request and nothing is saved.
+VIOLATION_CROSS_BATCH_BATCH_DUPLICATED = "CROSS_BATCH_BATCH_DUPLICATED"
+VIOLATION_CROSS_BATCH_COMPARISON_DUPLICATED = "CROSS_BATCH_COMPARISON_DUPLICATED"
+VIOLATION_CROSS_BATCH_COMPARISON_INCOMPLETE = "CROSS_BATCH_COMPARISON_INCOMPLETE"
+VIOLATION_CROSS_BATCH_SAMPLE_DUPLICATED = "CROSS_BATCH_SAMPLE_DUPLICATED"
+VIOLATION_CROSS_BATCH_SAMPLE_UNKNOWN = "CROSS_BATCH_SAMPLE_UNKNOWN"
+VIOLATION_CROSS_BATCH_SAMPLE_NOT_ELIGIBLE = "CROSS_BATCH_SAMPLE_NOT_ELIGIBLE"
+VIOLATION_CROSS_BATCH_CAPACITY_EXCEEDED = "CROSS_BATCH_CAPACITY_EXCEEDED"
+VIOLATION_CROSS_BATCH_NO_SOLUTION = "CROSS_BATCH_NO_SOLUTION"
+
 
 class PlateSpec(BaseModel):
     """Plate geometry.
@@ -589,3 +603,74 @@ class RetestPlanRequest(BaseModel):
         if any(n < 0 for n in v.values()):
             raise ValueError("every group count must be >= 0")
         return v
+
+
+class CrossBatchRef(BaseModel):
+    """One batch participating in a cross-batch comparison plan."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(min_length=1, description="ACTIVE 批次标识")
+    expected_revision: int = Field(
+        ge=1, description="期望的当前 revision;与证书当前值不一致时整次失败(409)"
+    )
+
+
+class ComparisonEntry(BaseModel):
+    """One comparison: exactly one sample per participating batch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    comparison_id: str = Field(min_length=1, description="对照标识")
+    samples: dict[str, str] = Field(
+        min_length=1,
+        description="batch_id → 该批次在本对照中的 sample_id;必须为每个参与批次恰好给一个",
+    )
+
+    @field_validator("samples")
+    @classmethod
+    def _sample_ids_nonempty(cls, v: dict[str, str]) -> dict[str, str]:
+        if any(not (b or "").strip() for b in v):
+            raise ValueError("batch ids in comparison samples must be non-empty strings")
+        if any(not (s or "").strip() for s in v.values()):
+            raise ValueError("sample ids in comparison samples must be non-empty strings")
+        return v
+
+
+class CrossBatchPlanRequest(BaseModel):
+    """Cross-batch comparison layout plan over ACTIVE batch certificates.
+
+    ``batches`` names 2–4 ACTIVE certificates and the revision each must be at.
+    Every ``comparisons`` entry maps ``comparison_id`` to exactly one
+    ``sample_id`` per batch; a sample may serve at most one comparison within
+    its batch. The service checks, inside one SQLite transaction, that every
+    certificate is still at its ``expected_revision`` and confirms from each
+    batch's immutable revision snapshot that every named sample is still at its
+    planned well in the frozen scan and carries a valid (finite, non-null)
+    reading at a well that is not blocked in the snapshot. A stale revision, a
+    duplicated/missing/unknown/ineligible sample, or an instance with no
+    feasible arrangement fails the whole request; no plan is saved.
+
+    The samples are placed on the target ``plate`` (respecting
+    ``blocked_wells``) lexicographically: first maximise the number of
+    orthogonal edges joining two samples of the same comparison, then maximise
+    the rows plus columns covered per batch and per (batch, experiment group);
+    ``seed`` resolves every remaining tie deterministically. The response gives
+    the sample → well layout together with the source revision/digest of every
+    batch.
+
+    ``request_key`` is the idempotency key: replaying the same key with
+    identical content returns the recorded response; the same key with
+    different content is rejected with 409.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_key: str = Field(
+        min_length=1, description="幂等键:同键同内容重放已记录响应,同键不同内容返回 409"
+    )
+    batches: list[CrossBatchRef] = Field(min_length=2, max_length=4)
+    comparisons: list[ComparisonEntry] = Field(min_length=1)
+    plate: PlateSpec = Field(default_factory=PlateSpec)
+    blocked_wells: list[str] = Field(default_factory=list)
+    seed: int = Field(default=0, ge=0, description="随机种子(≥0),用于确定性决胜")
